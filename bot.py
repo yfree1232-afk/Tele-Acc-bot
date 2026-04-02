@@ -1,232 +1,185 @@
-import logging
-import asyncio
-import tempfile
-import base64
 import os
+import sqlite3
+import zipfile
+import tempfile
+import shutil
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from telegram.constants import ParseMode
 
-from config import *
-from database import Database
-from session_manager import SessionManager
+# ==================== CONFIG ====================
+BOT_TOKEN = "8380437346:AAHQETsx6ZMIRdn6DzCFUNUz8pOOoCp24YA"  # Apna token daalo
+ADMIN_IDS = [8365074618]  # Apna Telegram ID daalo (screenshot mein dikh raha hai)
+PROMO_CHANNEL_ID = "-1001234567890"  # Apna channel ID daalo (optional)
 
-# Setup
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-db = Database()
-session_manager = SessionManager(db)
+# ==================== DATABASE ====================
+conn = sqlite3.connect("bot.db", check_same_thread=False)
+c = conn.cursor()
 
-# Temporary storage
-pending_purchases = {}
+c.execute('''CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    balance INTEGER DEFAULT 0
+)''')
 
-# ============ HELPER FUNCTIONS ============
-async def is_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not REQUIRED_CHANNEL:
-        return True
-    try:
-        user_id = update.effective_user.id
-        chat_member = await context.bot.get_chat_member(REQUIRED_CHANNEL, user_id)
-        return chat_member.status in ['member', 'administrator', 'creator']
-    except:
-        return False
+c.execute('''CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT,
+    country TEXT,
+    session_base64 TEXT,
+    status TEXT DEFAULT 'available'
+)''')
 
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, balance=0):
-    stats = db.get_stats()
-    keyboard = [
-        [InlineKeyboardButton("💰 Balance", callback_data="balance"),
-         InlineKeyboardButton("🛒 Buy Account", callback_data="buy")],
-        [InlineKeyboardButton("💳 Recharge", callback_data="recharge"),
-         InlineKeyboardButton("🎫 Redeem", callback_data="redeem")],
-        [InlineKeyboardButton("📜 History", callback_data="history"),
-         InlineKeyboardButton("👥 Refer", callback_data="refer")],
-        [InlineKeyboardButton("📊 Stock", callback_data="stock"),
-         InlineKeyboardButton("❓ Help", callback_data="help")]
-    ]
-    
-    text = MAIN_MENU_MESSAGE.format(balance, stats["total_purchases"])
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+c.execute('''CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT,
+    file_name TEXT,
+    session_base64 TEXT,
+    imported_at TEXT
+)''')
 
-# ============ USER COMMANDS ============
+conn.commit()
+
+# ==================== DATABASE FUNCTIONS ====================
+def get_balance(user_id):
+    c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row[0] if row else 0
+
+def update_balance(user_id, amount):
+    c.execute("INSERT OR REPLACE INTO users (user_id, balance) VALUES (?, COALESCE((SELECT balance FROM users WHERE user_id=?), 0) + ?)", 
+              (user_id, user_id, amount))
+    conn.commit()
+
+def add_account(phone, country, session_base64):
+    c.execute("INSERT INTO accounts (phone, country, session_base64) VALUES (?, ?, ?)", (phone, country, session_base64))
+    conn.commit()
+    print(f"✅ Account added: {phone}")
+
+def get_account():
+    c.execute("SELECT id, phone, session_base64 FROM accounts WHERE status='available' LIMIT 1")
+    row = c.fetchone()
+    if row:
+        c.execute("UPDATE accounts SET status='sold' WHERE id=?", (row[0],))
+        conn.commit()
+        return row
+    return None
+
+def add_session(phone, file_name, session_base64):
+    c.execute("INSERT INTO sessions (phone, file_name, session_base64, imported_at) VALUES (?, ?, ?, ?)", 
+              (phone, file_name, session_base64, datetime.now().isoformat()))
+    conn.commit()
+    print(f"✅ Session saved: {phone}")
+
+def get_all_sessions():
+    c.execute("SELECT phone, file_name FROM sessions ORDER BY imported_at DESC")
+    return c.fetchall()
+
+def count_accounts():
+    c.execute("SELECT COUNT(*) FROM accounts WHERE status='available'")
+    available = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM accounts WHERE status='sold'")
+    sold = c.fetchone()[0]
+    return available, sold
+
+# ==================== BOT HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
+    user_id = update.effective_user.id
+    if not get_balance(user_id):
+        update_balance(user_id, 0)
     
-    if REQUIRED_CHANNEL and not await is_member(update, context):
-        keyboard = [[InlineKeyboardButton("📢 Join Channel", url=CHANNEL_LINK)],
-                    [InlineKeyboardButton("✅ Verify", callback_data="verify")]]
-        await update.message.reply_text(
-            f"❌ You must subscribe to the official channel to use the bot.\n\n📧 Channel - {REQUIRED_CHANNEL}",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    if not db.get_user(user_id):
-        ref = context.args[0] if context.args else None
-        db.create_user(user_id, user.username, ref)
-        if ref:
-            db.update_balance(int(ref), 5)
-    
-    balance = db.get_balance(user_id)
-    await update.message.reply_text(START_MESSAGE.format(user.first_name, SUPPORT_USERNAME, SALES_USERNAME), parse_mode=ParseMode.MARKDOWN)
-    await show_main_menu(update, context, balance)
-
-async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if await is_member(update, context):
-        user_id = query.from_user.id
-        if not db.get_user(user_id):
-            db.create_user(user_id, query.from_user.username)
-        balance = db.get_balance(user_id)
-        await query.edit_message_text("✅ Verified! Welcome to the bot.")
-        await show_main_menu(update, context, balance)
-    else:
-        await query.edit_message_text(
-            f"❌ You haven't joined {REQUIRED_CHANNEL} yet.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Join Channel", url=CHANNEL_LINK)]])
-        )
+    await update.message.reply_text(
+        "🔥 *Welcome to Account Bot!*\n\n"
+        "💰 Buy Telegram accounts instantly!\n\n"
+        "Commands:\n"
+        "/balance - Check balance\n"
+        "/buy - Buy account\n"
+        "/recharge - Add balance\n"
+        "/redeem - Use promo code\n"
+        "/history - Your purchases",
+        parse_mode="Markdown"
+    )
 
 async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    balance = db.get_balance(query.from_user.id)
-    await query.edit_message_text(f"💰 **Your Balance:** `₹{balance}`\n\nUse /start to return to menu.", parse_mode=ParseMode.MARKDOWN)
+    user_id = update.effective_user.id
+    bal = get_balance(user_id)
+    await update.message.reply_text(f"💰 Your balance: *₹{bal}*", parse_mode="Markdown")
 
-# ============ BUY ACCOUNT ============
 async def buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    inventory = db.get_account_stats()
-    
-    keyboard = []
-    for code in ["+1", "+91", "+92"]:
-        price = db.get_price(code)
-        available = db.accounts.count_documents({"country_code": code, "status": "available"})
-        status_emoji = "✅" if available > 0 else "❌"
-        country_name = "🇺🇸 USA" if code == "+1" else "🇮🇳 India" if code == "+91" else "🇵🇰 Pakistan"
-        keyboard.append([InlineKeyboardButton(f"{country_name} - ₹{price} {status_emoji} ({available})", callback_data=f"buy_{code}")])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu")])
-    
-    await query.edit_message_text(
-        f"**Buy Telegram Accounts**\n\n📦 Available: {inventory['available']} accounts\n\nSelect country:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    keyboard = [
+        [InlineKeyboardButton("🇺🇸 USA - ₹14", callback_data="buy_+1")],
+        [InlineKeyboardButton("🇮🇳 India - ₹12", callback_data="buy_+91")],
+        [InlineKeyboardButton("🇵🇰 Pakistan - ₹11", callback_data="buy_+92")],
+    ]
+    await update.message.reply_text("Select country:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def buy_country_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    country_code = query.data.split("_")[1]
-    price = db.get_price(country_code)
     user_id = query.from_user.id
-    balance = db.get_balance(user_id)
+    country = query.data.split("_")[1]
+    
+    prices = {"+1": 14, "+91": 12, "+92": 11}
+    price = prices.get(country, 10)
+    
+    balance = get_balance(user_id)
     
     if balance < price:
-        await query.edit_message_text(
-            f"❌ Insufficient balance!\n\nNeed: ₹{price}\nYour balance: ₹{balance}\n\nUse /recharge to add funds",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💳 Recharge", callback_data="recharge")]])
-        )
+        await query.edit_message_text(f"❌ Insufficient balance!\nNeed: ₹{price}\nYour balance: ₹{balance}")
         return
     
-    account = db.get_available_account(country_code)
+    account = get_account()
     
     if not account:
-        await query.edit_message_text(
-            f"❌ No {country_code} accounts available.\n\nPlease check back later.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="buy")]])
-        )
+        await query.edit_message_text("❌ No accounts available! Admin needs to add accounts using /importzip")
         return
     
-    db.update_balance(user_id, -price)
+    account_id, phone, session_base64 = account
     
-    # Country details for promo
-    country_map = {
-        "+1": {"flag": "🇺🇸", "name": "USA"},
-        "+91": {"flag": "🇮🇳", "name": "India"},
-        "+92": {"flag": "🇵🇰", "name": "Pakistan"},
-    }
-    country_info = country_map.get(country_code, {"flag": "🌍", "name": country_code})
+    update_balance(user_id, -price)
     
-    # Send promo to channel if configured
+    # Send session file to user
+    import base64
+    try:
+        session_bytes = base64.b64decode(session_base64)
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.session')
+        temp_file.write(session_bytes)
+        temp_file.close()
+        
+        with open(temp_file.name, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=f,
+                filename=f"{phone}.session",
+                caption=f"✅ Account purchased!\nPhone: {phone}\nPrice: ₹{price}"
+            )
+        
+        os.unlink(temp_file.name)
+    except Exception as e:
+        await query.edit_message_text(f"✅ Account Purchased!\n\nPhone: {phone}\nPrice: ₹{price}\n\nSession file: {session_base64[:50]}...")
+    
+    # Send promo to channel
     if PROMO_CHANNEL_ID:
         promo_text = f"✅ **New Number Purchase Successful**\n\n"
-        promo_text += f"➖ Country: {country_info['flag']} {country_info['name']} | ₹{price}\n"
-        promo_text += f"➖ Application: Теlegr@м 🎉\n\n"
-        promo_text += f"➕ Number: `{account['phone'][:8]}•••••` 📞\n"
-        promo_text += f"➕ Server: (1) 🚀\n\n"
-        promo_text += f"• {SUPPORT_USERNAME} || @{BOT_USERNAME}"
+        promo_text += f"➖ Country: {country} | ₹{price}\n"
+        promo_text += f"➖ Application: Telegram 🎉\n\n"
+        promo_text += f"➕ Number: `{phone[:8]}•••••` 📞\n"
+        promo_text += f"➕ Server: (1) 🚀"
         
         try:
-            await context.bot.send_message(
-                chat_id=PROMO_CHANNEL_ID,
-                text=promo_text,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception as e:
-            print(f"Promo error: {e}")
+            await context.bot.send_message(chat_id=PROMO_CHANNEL_ID, text=promo_text, parse_mode="Markdown")
+        except:
+            pass
     
-    # Delivery to user
-    delivery_text = f"✅ **Account Purchased!**\n\n"
-    delivery_text += f"📱 **Phone:** `{account['phone']}`\n\n"
-    
-    session_base64 = account.get("session_base64")
-    if session_base64:
-        try:
-            session_bytes = base64.b64decode(session_base64)
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.session')
-            temp_file.write(session_bytes)
-            temp_file.close()
-            
-            with open(temp_file.name, 'rb') as f:
-                await context.bot.send_document(
-                    chat_id=user_id,
-                    document=f,
-                    filename=f"{account['phone'].replace('+', '')}.session",
-                    caption=f"📱 Session file for {account['phone']}"
-                )
-            
-            os.unlink(temp_file.name)
-            delivery_text += f"📁 **Session file sent above!**\n\n"
-        except Exception as e:
-            delivery_text += f"📁 Session file attached above\n\n"
-    
-    delivery_text += f"💰 Price: ₹{price}\n"
-    delivery_text += f"📧 Support: {SUPPORT_USERNAME}\n\n"
-    delivery_text += f"⚠️ Change password immediately after login!"
-    
-    db.confirm_sale(account["_id"], user_id)
-    db.add_purchase(user_id, account["phone"], country_code, price)
-    
-    await query.edit_message_text(
-        delivery_text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu"),
-                                           InlineKeyboardButton("🛒 Buy Another", callback_data="buy")]])
-    )
+    await query.edit_message_text(f"✅ Account delivered!\n\nPhone: {phone}\nPrice: ₹{price}\n\nCheck your DM for session file.")
 
-# ============ MANUAL RECHARGE ============
 async def recharge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    await query.edit_message_text(
-        f"💳 **Manual Recharge**\n\n"
-        f"UPI ID: `{UPI_ID}`\n\n"
-        f"**Steps:**\n"
-        f"1. Send payment to above UPI ID\n"
-        f"2. Send `/confirm <amount> <transaction_id>`\n"
-        f"3. Admin will verify and add balance\n\n"
-        f"Example: `/confirm 100 TXN123456`",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu")]])
+    await update.message.reply_text(
+        "💳 *Recharge*\n\n"
+        "UPI ID: `yourupi@okhdfcbank`\n\n"
+        "After payment, send:\n"
+        "`/confirm 100 TXN123456`",
+        parse_mode="Markdown"
     )
 
 async def confirm_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,162 +187,23 @@ async def confirm_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     
     if len(args) < 2:
-        await update.message.reply_text("Usage: /confirm <amount> <transaction_id>\nExample: /confirm 100 TXN123456")
+        await update.message.reply_text("Usage: /confirm <amount> <transaction_id>")
         return
     
-    try:
-        amount = int(args[0])
-        txn_id = args[1]
-        
-        pending_purchases[user_id] = {
-            "amount": amount,
-            "txn_id": txn_id,
-            "status": "pending"
-        }
-        
-        for admin_id in ADMIN_IDS:
-            await context.bot.send_message(
-                admin_id,
-                f"💰 **Payment Request**\n\n"
-                f"User: {update.effective_user.first_name} (ID: {user_id})\n"
-                f"Amount: ₹{amount}\n"
-                f"Transaction ID: {txn_id}\n\n"
-                f"Approve: `/approve {user_id} {amount}`\n"
-                f"Reject: `/reject {user_id}`"
-            )
-        
-        await update.message.reply_text(
-            f"✅ Payment request submitted!\n\n"
-            f"Amount: ₹{amount}\n"
-            f"Transaction ID: {txn_id}\n\n"
-            f"Admin will verify shortly."
+    amount = int(args[0])
+    txn_id = args[1]
+    
+    for admin_id in ADMIN_IDS:
+        await context.bot.send_message(
+            admin_id,
+            f"💰 Payment Request\n\nUser: {user_id}\nAmount: ₹{amount}\nTxn ID: {txn_id}\n\n/approve {user_id} {amount}"
         )
-    except:
-        await update.message.reply_text("Invalid format. Use: /confirm <amount> <transaction_id>")
+    
+    await update.message.reply_text(f"✅ Request sent! Admin will approve soon.")
 
-# ============ REDEEM ============
-async def redeem_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    await query.edit_message_text(
-        "🎫 **Redeem Code**\n\n"
-        "Send your redeem code:\n"
-        "Example: `QC-ABC123`",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu")]])
-    )
-    context.user_data['redeem_step'] = True
-
-async def handle_redeem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('redeem_step'):
-        code = update.message.text.strip()
-        user_id = update.effective_user.id
-        result = db.redeem_code(code, user_id)
-        
-        if result == "invalid":
-            await update.message.reply_text("❌ Invalid code!")
-        elif result == "used":
-            await update.message.reply_text("❌ Code already used!")
-        else:
-            await update.message.reply_text(f"✅ Code redeemed! ₹{result} added to your balance.")
-        
-        context.user_data['redeem_step'] = None
-        balance = db.get_balance(user_id)
-        await show_main_menu(update, context, balance)
-
-# ============ HISTORY ============
-async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    purchases = db.get_user_purchases(user_id, 5)
-    
-    if not purchases:
-        text = "📜 **Purchase History**\n\nNo purchases yet."
-    else:
-        text = "📜 **Recent Purchases:**\n\n"
-        for p in purchases:
-            date = p.get("created_at", datetime.now()).strftime("%d/%m")
-            text += f"• {date}: {p['phone']} - ₹{p['amount']}\n"
-    
-    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu")]]))
-
-# ============ REFER ============
-async def refer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    bot_username = BOT_USERNAME
-    
-    await query.edit_message_text(
-        f"👥 **Referral Program**\n\n"
-        f"Invite friends and earn ₹5 when they join!\n\n"
-        f"Your referral link:\n"
-        f"`https://t.me/{bot_username}?start={user_id}`\n\n"
-        f"Share this link with your friends.",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu")]])
-    )
-
-# ============ STOCK ============
-async def stock_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    inventory = db.get_account_stats()
-    
-    text = f"📦 **Account Inventory**\n\n"
-    for code in ["+1", "+91", "+92"]:
-        price = db.get_price(code)
-        available = db.accounts.count_documents({"country_code": code, "status": "available"})
-        sold = db.accounts.count_documents({"country_code": code, "status": "sold"})
-        country_name = "USA" if code == "+1" else "India" if code == "+91" else "Pakistan"
-        text += f"📱 {country_name}: {available} available | {sold} sold | ₹{price} each\n"
-    
-    text += f"\n📊 **Total:** {inventory['total']} accounts"
-    
-    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu")]]))
-
-# ============ HELP ============
-async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    await query.edit_message_text(
-        f"**Help & Support**\n\n"
-        f"• /buy - Purchase Telegram account\n"
-        f"• /balance - Check your balance\n"
-        f"• /recharge - Add balance\n"
-        f"• /redeem - Use promo code\n"
-        f"• /history - View purchases\n"
-        f"• /refer - Get referral link\n\n"
-        f"📧 Support: {SUPPORT_USERNAME}",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu")]])
-    )
-
-# ============ ADMIN COMMANDS ============
-async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def approve_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Unauthorized")
-        return
-    
-    stats = db.get_stats()
-    await update.message.reply_text(
-        f"📊 **Bot Statistics**\n\n"
-        f"👥 Users: {stats['total_users']}\n"
-        f"💰 Total Balance: ₹{stats['total_balance']}\n"
-        f"🛒 Purchases: {stats['total_purchases']}\n"
-        f"💵 Revenue: ₹{stats['total_revenue']}\n\n"
-        f"📦 Inventory: {stats['inventory']['available']}/{stats['inventory']['total']} available",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
         return
     
     args = context.args
@@ -400,177 +214,152 @@ async def admin_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = int(args[0])
     amount = int(args[1])
     
-    db.update_balance(user_id, amount)
-    
+    update_balance(user_id, amount)
     await update.message.reply_text(f"✅ Added ₹{amount} to user {user_id}")
     
     try:
-        await context.bot.send_message(user_id, f"✅ Your payment of ₹{amount} has been approved! Balance updated.")
+        await context.bot.send_message(user_id, f"✅ ₹{amount} added to your balance!")
     except:
         pass
 
-async def admin_add_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def import_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
-        return
-    
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("Usage: /addcode <code> <amount>\nExample: /addcode SALE50 50")
-        return
-    
-    code = args[0]
-    amount = int(args[1])
-    
-    if db.add_redeem_code(code, amount):
-        await update.message.reply_text(f"✅ Code {code} added with ₹{amount}")
-    else:
-        await update.message.reply_text("❌ Code already exists!")
-
-async def admin_list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        return
-    
-    accounts = db.get_all_available_accounts()
-    
-    if not accounts:
-        await update.message.reply_text("No available accounts.")
-        return
-    
-    text = f"📦 **Available Accounts ({len(accounts)}):**\n\n"
-    for acc in accounts[:20]:
-        text += f"• {acc['phone']} ({acc['country_code']})\n"
-    
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-
-async def admin_import_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Unauthorized")
         return
     
     if not update.message.document:
         await update.message.reply_text("Please send a ZIP file containing .session files.")
         return
     
+    await update.message.reply_text("🔄 Processing ZIP file... Please wait.")
+    
     file = await update.message.document.get_file()
-    
-    await update.message.reply_text("🔄 Downloading and importing sessions... This may take a while.")
-    
     zip_path = f"/tmp/{file.file_id}.zip"
     await file.download_to_drive(zip_path)
     
-    results = await session_manager.import_zip_file(zip_path)
+    temp_dir = tempfile.mkdtemp()
+    imported = []
+    failed = []
     
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+        
+        for root, dirs, files in os.walk(temp_dir):
+            for file_name in files:
+                if file_name.endswith('.session'):
+                    session_path = os.path.join(root, file_name)
+                    
+                    try:
+                        with open(session_path, 'rb') as f:
+                            session_base64 = base64.b64encode(f.read()).decode('utf-8')
+                        
+                        phone = file_name.replace('.session', '')
+                        
+                        # Detect country
+                        if phone.startswith('+1'):
+                            country = '+1'
+                        elif phone.startswith('+91'):
+                            country = '+91'
+                        elif phone.startswith('+92'):
+                            country = '+92'
+                        else:
+                            country = '+91'
+                        
+                        add_account(phone, country, session_base64)
+                        add_session(phone, file_name, session_base64)
+                        imported.append(phone)
+                        print(f"✅ Imported: {phone}")
+                        
+                    except Exception as e:
+                        failed.append(f"{file_name}: {str(e)}")
+    
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        os.remove(zip_path)
+        return
+    
+    shutil.rmtree(temp_dir, ignore_errors=True)
     os.remove(zip_path)
     
-    success_text = f"✅ Imported: {len(results['success'])} accounts\n"
-    if results['success']:
-        success_text += "\n".join(results['success'][:5])
-    failed_text = f"\n\n❌ Failed: {len(results['failed'])} accounts"
-    
-    await update.message.reply_text(f"{success_text}{failed_text}")
+    await update.message.reply_text(
+        f"✅ Import complete!\n\n"
+        f"Imported: {len(imported)} accounts\n"
+        f"Failed: {len(failed)}\n\n"
+        f"Use /listacc to see all accounts."
+    )
 
-async def admin_show_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Unauthorized")
         return
     
-    await update.message.reply_text(
-        f"📊 **Current Selling Prices:**\n\n"
-        f"🇺🇸 USA: `₹{db.get_price('+1')}`\n"
-        f"🇮🇳 India: `₹{db.get_price('+91')}`\n"
-        f"🇵🇰 Pakistan: `₹{db.get_price('+92')}`\n\n"
-        f"To change price:\n"
-        f"`/setprice +91 15` - Change India price to ₹15\n"
-        f"`/setprice +1 20` - Change USA price to ₹20\n"
-        f"`/setprice +92 13` - Change Pakistan price to ₹13",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    accounts = get_all_sessions()
+    
+    if not accounts:
+        await update.message.reply_text("No accounts found. Use /importzip first.")
+        return
+    
+    text = f"📦 **Session Files ({len(accounts)}):**\n\n"
+    for phone, file_name in accounts[:20]:
+        text += f"• {phone} ({file_name})\n"
+    
+    await update.message.reply_text(text, parse_mode="Markdown")
 
-async def admin_set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Unauthorized")
         return
     
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "❌ Usage: `/setprice +91 15`\n\n"
-            "Examples:\n"
-            "/setprice +1 20 - USA ₹20\n"
-            "/setprice +91 15 - India ₹15\n"
-            "/setprice +92 13 - Pakistan ₹13",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
+    available, sold = count_accounts()
+    c.execute("SELECT COUNT(*) FROM users")
+    users = c.fetchone()[0]
+    c.execute("SELECT SUM(balance) FROM users")
+    total_balance = c.fetchone()[0] or 0
     
-    country_code = args[0]
-    try:
-        new_price = int(args[1])
-    except:
-        await update.message.reply_text("❌ Invalid price. Use number only.")
-        return
-    if country_code not in ["+1", "+91", "+92"]:
-        await update.message.reply_text("❌ Invalid country. Use: +1, +91, +92")
-        return
-    
-    if new_price < 1:
-        await update.message.reply_text("❌ Price must be at least ₹1")
-        return
-    
-    db.set_price(country_code, new_price)
-    
-    country_name = "USA" if country_code == "+1" else "India" if country_code == "+91" else "Pakistan"
     await update.message.reply_text(
-        f"✅ **Price Updated!**\n\n"
-        f"{country_name} ({country_code}) → ₹{new_price}\n\n"
-        f"**Current Prices:**\n"
-        f"🇺🇸 USA: ₹{db.get_price('+1')}\n"
-        f"🇮🇳 India: ₹{db.get_price('+91')}\n"
-        f"🇵🇰 Pakistan: ₹{db.get_price('+92')}",
-        parse_mode=ParseMode.MARKDOWN
+        f"📊 **Bot Stats**\n\n"
+        f"Users: {users}\n"
+        f"Available accounts: {available}\n"
+        f"Sold accounts: {sold}\n"
+        f"Total balance: ₹{total_balance}",
+        parse_mode="Markdown"
     )
 
-# ============ MENU CALLBACK ============
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    balance = db.get_balance(query.from_user.id)
-    await show_main_menu(update, context, balance)
+async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.message.reply_text("📜 Use /listacc (admin only) to see accounts")
 
-# ============ MAIN ============
+async def redeem_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎫 Send redeem code. Coming soon.")
+
+# ==================== MAIN ====================
 def main():
+    import base64  # Add this import
+    
     app = Application.builder().token(BOT_TOKEN).build()
     
     # User commands
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("balance", balance_handler))
+    app.add_handler(CommandHandler("buy", buy_handler))
+    app.add_handler(CommandHandler("recharge", recharge_handler))
     app.add_handler(CommandHandler("confirm", confirm_payment))
+    app.add_handler(CommandHandler("redeem", redeem_handler))
+    app.add_handler(CommandHandler("history", history_handler))
     
     # Admin commands
-    app.add_handler(CommandHandler("stats", admin_stats))
-    app.add_handler(CommandHandler("approve", admin_approve))
-    app.add_handler(CommandHandler("addcode", admin_add_code))
-    app.add_handler(CommandHandler("listacc", admin_list_accounts))
-    app.add_handler(CommandHandler("importzip", admin_import_zip))
-    app.add_handler(CommandHandler("prices", admin_show_prices))
-
+    app.add_handler(CommandHandler("approve", approve_payment))
+    app.add_handler(CommandHandler("importzip", import_zip))
+    app.add_handler(CommandHandler("listacc", list_accounts))
+    app.add_handler(CommandHandler("stats", stats_handler))
+    
     # Callbacks
-    app.add_handler(CallbackQueryHandler(verify_callback, pattern="verify"))
-    app.add_handler(CallbackQueryHandler(balance_handler, pattern="balance"))
-    app.add_handler(CallbackQueryHandler(buy_handler, pattern="buy$"))
-    app.add_handler(CallbackQueryHandler(buy_country_handler, pattern="buy_"))
-    app.add_handler(CallbackQueryHandler(recharge_handler, pattern="recharge"))
-    app.add_handler(CallbackQueryHandler(redeem_handler, pattern="redeem"))
-    app.add_handler(CallbackQueryHandler(history_handler, pattern="history"))
-    app.add_handler(CallbackQueryHandler(refer_handler, pattern="refer"))
-    app.add_handler(CallbackQueryHandler(stock_handler, pattern="stock"))
-    app.add_handler(CallbackQueryHandler(help_handler, pattern="help"))
-    app.add_handler(CallbackQueryHandler(menu_callback, pattern="menu"))
+    app.add_handler(CallbackQueryHandler(buy_callback, pattern="buy_"))
     
-    # Message handlers
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_redeem))
-    
-    print("🤖 Bot started successfully!")
+    print("🤖 Bot started! Ready to import sessions.")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-  
