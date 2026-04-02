@@ -4,43 +4,36 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # MongoDB
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb+srv://username:password@cluster.mongodb.net/")
+MONGO_URI = os.environ.get("MONGO_URI")
 DATABASE_NAME = os.environ.get("DATABASE_NAME", "telegram_account_bot")
 
 # Bot Token
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# Admin IDs
-ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "123456789").split(",")]
+# Telegram API (for session validation)
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH")
 
-# Required channel
-REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "@vthnet")
-CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "https://t.me/vthnet")
+# Admin IDs
+ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
+
+# Required channel (optional)
+REQUIRED_CHANNEL = os.environ.get("REQUIRED_CHANNEL", "")
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "")
 
 # Support
-SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@vthnet")
-SALES_USERNAME = os.environ.get("SALES_USERNAME", "@vthproofs")
+SUPPORT_USERNAME = os.environ.get("SUPPORT_USERNAME", "@support")
+SALES_USERNAME = os.environ.get("SALES_USERNAME", "@sales")
 
-# Selling prices (jo user pay karega)
+# Selling prices
 SELLING_PRICES = {
-    "+1": int(os.environ.get("PRICE_USA", "14")),     # USA
-    "+91": int(os.environ.get("PRICE_INDIA", "12")),  # India
-    "+92": int(os.environ.get("PRICE_PAK", "11")),    # Pakistan
+    "+1": int(os.environ.get("PRICE_USA", "14")),
+    "+91": int(os.environ.get("PRICE_INDIA", "12")),
+    "+92": int(os.environ.get("PRICE_PAK", "11")),
 }
 
-# Purchase cost (kitne me account liya)
-PURCHASE_COST = {
-    "+1": int(os.environ.get("COST_USA", "5")),
-    "+91": int(os.environ.get("COST_INDIA", "3")),
-    "+92": int(os.environ.get("COST_PAK", "3")),
-}
-
-# Payment UPI
+# UPI ID for manual recharge
 UPI_ID = os.environ.get("UPI_ID", "yourupi@okhdfcbank")
-
-# External Panel API (jahan se accounts milte hain)
-PANEL_API_URL = os.environ.get("PANEL_API_URL", "")
-PANEL_API_KEY = os.environ.get("PANEL_API_KEY", "")
 
 # Messages
 START_MESSAGE = """
@@ -51,8 +44,8 @@ Welcome To Account Robot - Fastest Telegram Account Seller Bot ❤️
 🎉 Enjoy Fast Account buying Experience!
 
 ---
-Support - @vthnet
-Sales - @vthproofs
+Support - {}
+Sales - {}
 """
 
 MAIN_MENU_MESSAGE = """
@@ -60,7 +53,7 @@ MAIN_MENU_MESSAGE = """
 
 💰 Balance: `₹{}`
 
-📊 Total Accounts Sold: `{}`
+📊 Accounts Sold: `{}`
 
 Choose an option below:
 """
