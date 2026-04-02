@@ -1,7 +1,7 @@
+import base64
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
-import datetime
-import os
+from datetime import datetime
 from config import MONGO_URI, DATABASE_NAME
 
 class Database:
@@ -15,7 +15,7 @@ class Database:
         self.transactions = self.db.transactions
         self.redeem_codes = self.db.redeem_codes
         
-        # Create indexes
+        # Indexes
         self.users.create_index("user_id", unique=True)
         self.accounts.create_index("phone", unique=True)
         self.accounts.create_index("status")
@@ -33,7 +33,7 @@ class Database:
                 "balance": 0,
                 "total_purchases": 0,
                 "total_spent": 0,
-                "joined_date": datetime.datetime.now(),
+                "joined_date": datetime.now(),
                 "referred_by": referred_by
             })
             return True
@@ -50,24 +50,30 @@ class Database:
         user = self.users.find_one({"user_id": user_id})
         return user["balance"] if user else 0
     
-    # ============ ACCOUNT METHODS (Inventory) ============
-    def add_account(self, phone, country_code, otp, two_fa=None, cost_price=0):
-        """Add account to inventory"""
-        self.accounts.insert_one({
-            "phone": phone,
-            "country_code": country_code,
-            "otp": otp,
-            "two_fa": two_fa,
-            "cost_price": cost_price,
-            "status": "available",  # available, sold
-            "sold_to": None,
-            "sold_at": None,
-            "added_at": datetime.datetime.now()
-        })
-        return True
+    # ============ ACCOUNT METHODS ============
+    def add_account(self, phone, country_code, session_base64, first_name=None, username=None):
+        """Add account with session stored as Base64"""
+        try:
+            self.accounts.insert_one({
+                "phone": phone,
+                "country_code": country_code,
+                "session_base64": session_base64,
+                "first_name": first_name,
+                "username": username,
+                "status": "available",
+                "sold_to": None,
+                "sold_at": None,
+                "added_at": datetime.now()
+            })
+            return True
+        except DuplicateKeyError:
+            return False
+    
+    def get_account_by_phone(self, phone):
+        return self.accounts.find_one({"phone": phone})
     
     def get_available_account(self, country_code):
-        """Fetch one available account for selling"""
+        """Get one available account and mark as reserved"""
         account = self.accounts.find_one_and_update(
             {
                 "country_code": country_code,
@@ -80,36 +86,37 @@ class Database:
         )
         return account
     
-    def confirm_account_sold(self, account_id, user_id):
-        """Mark account as sold after payment"""
+    def confirm_sale(self, account_id, user_id):
+        """Mark account as sold"""
+        from bson.objectid import ObjectId
         self.accounts.update_one(
-            {"_id": account_id},
+            {"_id": ObjectId(account_id)},
             {
                 "$set": {
                     "status": "sold",
                     "sold_to": user_id,
-                    "sold_at": datetime.datetime.now()
+                    "sold_at": datetime.now()
                 }
             }
         )
     
-    def release_reserved_account(self, account_id):
-        """If payment fails, release account back"""
+    def release_account(self, account_id):
+        """Release reserved account back to available"""
+        from bson.objectid import ObjectId
         self.accounts.update_one(
-            {"_id": account_id},
+            {"_id": ObjectId(account_id)},
             {"$set": {"status": "available"}}
         )
     
     def get_account_stats(self):
-        """Inventory stats"""
         total = self.accounts.count_documents({})
         available = self.accounts.count_documents({"status": "available"})
         sold = self.accounts.count_documents({"status": "sold"})
-        return {
-            "total": total,
-            "available": available,
-            "sold": sold
-        }
+        return {"total": total, "available": available, "sold": sold}
+    
+    def get_all_available_accounts(self):
+        """Get all available accounts (for admin)"""
+        return list(self.accounts.find({"status": "available"}))
     
     # ============ PURCHASE METHODS ============
     def add_purchase(self, user_id, phone, country_code, amount):
@@ -120,25 +127,18 @@ class Database:
             "phone": phone,
             "country_code": country_code,
             "status": "completed",
-            "created_at": datetime.datetime.now()
+            "created_at": datetime.now()
         })
         
-        # Update user stats
         self.users.update_one(
             {"user_id": user_id},
-            {
-                "$inc": {
-                    "total_purchases": 1,
-                    "total_spent": amount
-                }
-            }
+            {"$inc": {"total_purchases": 1, "total_spent": amount}}
         )
     
     def get_user_purchases(self, user_id, limit=10):
-        purchases = self.transactions.find(
+        return list(self.transactions.find(
             {"user_id": user_id, "type": "purchase"}
-        ).sort("created_at", -1).limit(limit)
-        return list(purchases)
+        ).sort("created_at", -1).limit(limit))
     
     # ============ REDEEM CODES ============
     def add_redeem_code(self, code, amount):
@@ -148,7 +148,7 @@ class Database:
                 "amount": amount,
                 "used_by": None,
                 "used_at": None,
-                "created_at": datetime.datetime.now()
+                "created_at": datetime.now()
             })
             return True
         except DuplicateKeyError:
@@ -159,34 +159,25 @@ class Database:
         
         if not code_data:
             return "invalid"
-        
         if code_data.get("used_by"):
             return "used"
         
         amount = code_data["amount"]
         
-        # Mark as used
         self.redeem_codes.update_one(
             {"code": code},
-            {
-                "$set": {
-                    "used_by": user_id,
-                    "used_at": datetime.datetime.now()
-                }
-            }
+            {"$set": {"used_by": user_id, "used_at": datetime.now()}}
         )
         
-        # Add balance
         self.update_balance(user_id, amount)
         
-        # Log transaction
         self.transactions.insert_one({
             "user_id": user_id,
             "type": "redeem",
             "amount": amount,
             "code": code,
             "status": "completed",
-            "created_at": datetime.datetime.now()
+            "created_at": datetime.now()
         })
         
         return amount
@@ -194,10 +185,9 @@ class Database:
     # ============ STATS ============
     def get_stats(self):
         total_users = self.users.count_documents({})
-        total_balance = sum([u["balance"] for u in self.users.find()])
+        total_balance = sum([u.get("balance", 0) for u in self.users.find()])
         total_purchases = self.transactions.count_documents({"type": "purchase"})
-        total_revenue = sum([t["amount"] for t in self.transactions.find({"type": "purchase"})])
-        
+        total_revenue = sum([t.get("amount", 0) for t in self.transactions.find({"type": "purchase"})])
         inventory = self.get_account_stats()
         
         return {
@@ -206,4 +196,4 @@ class Database:
             "total_purchases": total_purchases,
             "total_revenue": total_revenue,
             "inventory": inventory
-            }
+        }
