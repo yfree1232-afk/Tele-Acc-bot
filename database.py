@@ -197,3 +197,32 @@ class Database:
             "total_revenue": total_revenue,
             "inventory": inventory
         }
+
+# Add this new collection in database.py __init__ method
+self.settings = self.db.settings
+
+# Add these methods in Database class
+def get_price(self, country_code):
+    """Get price for a country"""
+    setting = self.settings.find_one({"key": f"price_{country_code}"})
+    if setting:
+        return setting["value"]
+    # Default prices
+    defaults = {"+1": 14, "+91": 12, "+92": 11}
+    return defaults.get(country_code, 10)
+
+def set_price(self, country_code, price):
+    """Set price for a country"""
+    self.settings.update_one(
+        {"key": f"price_{country_code}"},
+        {"$set": {"value": price, "updated_at": datetime.now()}},
+        upsert=True
+    )
+    return True
+
+def get_all_prices(self):
+    """Get all prices"""
+    prices = {}
+    for code in ["+1", "+91", "+92"]:
+        prices[code] = self.get_price(code)
+    return prices
