@@ -1,4 +1,3 @@
-import base64
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from datetime import datetime
@@ -14,6 +13,7 @@ class Database:
         self.accounts = self.db.accounts
         self.transactions = self.db.transactions
         self.redeem_codes = self.db.redeem_codes
+        self.settings = self.db.settings
         
         # Indexes
         self.users.create_index("user_id", unique=True)
@@ -50,9 +50,30 @@ class Database:
         user = self.users.find_one({"user_id": user_id})
         return user["balance"] if user else 0
     
+    # ============ PRICE METHODS ============
+    def get_price(self, country_code):
+        setting = self.settings.find_one({"key": f"price_{country_code}"})
+        if setting:
+            return setting["value"]
+        defaults = {"+1": 14, "+91": 12, "+92": 11}
+        return defaults.get(country_code, 10)
+    
+    def set_price(self, country_code, price):
+        self.settings.update_one(
+            {"key": f"price_{country_code}"},
+            {"$set": {"value": price, "updated_at": datetime.now()}},
+            upsert=True
+        )
+        return True
+    
+    def get_all_prices(self):
+        prices = {}
+        for code in ["+1", "+91", "+92"]:
+            prices[code] = self.get_price(code)
+        return prices
+    
     # ============ ACCOUNT METHODS ============
     def add_account(self, phone, country_code, session_base64, first_name=None, username=None):
-        """Add account with session stored as Base64"""
         try:
             self.accounts.insert_one({
                 "phone": phone,
@@ -73,7 +94,6 @@ class Database:
         return self.accounts.find_one({"phone": phone})
     
     def get_available_account(self, country_code):
-        """Get one available account and mark as reserved"""
         account = self.accounts.find_one_and_update(
             {
                 "country_code": country_code,
@@ -87,7 +107,6 @@ class Database:
         return account
     
     def confirm_sale(self, account_id, user_id):
-        """Mark account as sold"""
         from bson.objectid import ObjectId
         self.accounts.update_one(
             {"_id": ObjectId(account_id)},
@@ -101,7 +120,6 @@ class Database:
         )
     
     def release_account(self, account_id):
-        """Release reserved account back to available"""
         from bson.objectid import ObjectId
         self.accounts.update_one(
             {"_id": ObjectId(account_id)},
@@ -115,7 +133,6 @@ class Database:
         return {"total": total, "available": available, "sold": sold}
     
     def get_all_available_accounts(self):
-        """Get all available accounts (for admin)"""
         return list(self.accounts.find({"status": "available"}))
     
     # ============ PURCHASE METHODS ============
@@ -197,32 +214,3 @@ class Database:
             "total_revenue": total_revenue,
             "inventory": inventory
         }
-
-# Add this new collection in database.py __init__ method
-self.settings = self.db.settings
-
-# Add these methods in Database class
-def get_price(self, country_code):
-    """Get price for a country"""
-    setting = self.settings.find_one({"key": f"price_{country_code}"})
-    if setting:
-        return setting["value"]
-    # Default prices
-    defaults = {"+1": 14, "+91": 12, "+92": 11}
-    return defaults.get(country_code, 10)
-
-def set_price(self, country_code, price):
-    """Set price for a country"""
-    self.settings.update_one(
-        {"key": f"price_{country_code}"},
-        {"$set": {"value": price, "updated_at": datetime.now()}},
-        upsert=True
-    )
-    return True
-
-def get_all_prices(self):
-    """Get all prices"""
-    prices = {}
-    for code in ["+1", "+91", "+92"]:
-        prices[code] = self.get_price(code)
-    return prices
