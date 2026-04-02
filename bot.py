@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 
 # ==================== CONFIG ====================
 BOT_TOKEN = "8380437346:AAHQETsx6ZMIRdn6DzCFUNUz8pOOoCp24YA"  # Apna token daalo
-ADMIN_IDS = [8365074618]  # Apna Telegram ID daalo (screenshot mein dikh raha hai)
+ADMIN_IDS = [8342248523]  # Apna Telegram ID daalo (screenshot mein dikh raha hai)
 PROMO_CHANNEL_ID = "-1001234567890"  # Apna channel ID daalo (optional)
 
 # ==================== DATABASE ====================
