@@ -3,14 +3,15 @@ import sqlite3
 import zipfile
 import tempfile
 import shutil
+import base64
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # ==================== CONFIG ====================
-BOT_TOKEN = "8380437346:AAHQETsx6ZMIRdn6DzCFUNUz8pOOoCp24YA"  # Apna token daalo
-ADMIN_IDS = [8342248523]  # Apna Telegram ID daalo (screenshot mein dikh raha hai)
-PROMO_CHANNEL_ID = "-1001234567890"  # Apna channel ID daalo (optional)
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+ADMIN_IDS = [8365074618]  # Apna ID daalo
+PROMO_CHANNEL_ID = ""  # Optional
 
 # ==================== DATABASE ====================
 conn = sqlite3.connect("bot.db", check_same_thread=False)
@@ -39,7 +40,7 @@ c.execute('''CREATE TABLE IF NOT EXISTS sessions (
 
 conn.commit()
 
-# ==================== DATABASE FUNCTIONS ====================
+# ==================== FUNCTIONS ====================
 def get_balance(user_id):
     c.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
     row = c.fetchone()
@@ -53,22 +54,11 @@ def update_balance(user_id, amount):
 def add_account(phone, country, session_base64):
     c.execute("INSERT INTO accounts (phone, country, session_base64) VALUES (?, ?, ?)", (phone, country, session_base64))
     conn.commit()
-    print(f"✅ Account added: {phone}")
-
-def get_account():
-    c.execute("SELECT id, phone, session_base64 FROM accounts WHERE status='available' LIMIT 1")
-    row = c.fetchone()
-    if row:
-        c.execute("UPDATE accounts SET status='sold' WHERE id=?", (row[0],))
-        conn.commit()
-        return row
-    return None
 
 def add_session(phone, file_name, session_base64):
     c.execute("INSERT INTO sessions (phone, file_name, session_base64, imported_at) VALUES (?, ?, ?, ?)", 
               (phone, file_name, session_base64, datetime.now().isoformat()))
     conn.commit()
-    print(f"✅ Session saved: {phone}")
 
 def get_all_sessions():
     c.execute("SELECT phone, file_name FROM sessions ORDER BY imported_at DESC")
@@ -80,6 +70,15 @@ def count_accounts():
     c.execute("SELECT COUNT(*) FROM accounts WHERE status='sold'")
     sold = c.fetchone()[0]
     return available, sold
+
+def get_account():
+    c.execute("SELECT id, phone, session_base64 FROM accounts WHERE status='available' LIMIT 1")
+    row = c.fetchone()
+    if row:
+        c.execute("UPDATE accounts SET status='sold' WHERE id=?", (row[0],))
+        conn.commit()
+        return row
+    return None
 
 # ==================== BOT HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -94,8 +93,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/balance - Check balance\n"
         "/buy - Buy account\n"
         "/recharge - Add balance\n"
-        "/redeem - Use promo code\n"
-        "/history - Your purchases",
+        "/history - Your purchases\n"
+        "/listacc - List available (admin)\n"
+        "/stats - Bot stats (admin)",
         parse_mode="Markdown"
     )
 
@@ -138,8 +138,6 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     update_balance(user_id, -price)
     
-    # Send session file to user
-    import base64
     try:
         session_bytes = base64.b64decode(session_base64)
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.session')
@@ -156,22 +154,145 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         os.unlink(temp_file.name)
     except Exception as e:
-        await query.edit_message_text(f"✅ Account Purchased!\n\nPhone: {phone}\nPrice: ₹{price}\n\nSession file: {session_base64[:50]}...")
+        await query.edit_message_text(f"✅ Account Purchased!\n\nPhone: {phone}\nPrice: ₹{price}")
     
-    # Send promo to channel
     if PROMO_CHANNEL_ID:
-        promo_text = f"✅ **New Number Purchase Successful**\n\n"
-        promo_text += f"➖ Country: {country} | ₹{price}\n"
-        promo_text += f"➖ Application: Telegram 🎉\n\n"
-        promo_text += f"➕ Number: `{phone[:8]}•••••` 📞\n"
-        promo_text += f"➕ Server: (1) 🚀"
-        
+        promo_text = f"✅ **New Number Purchase Successful**\n\n➖ Country: {country} | ₹{price}\n➕ Number: `{phone[:8]}•••••`"
         try:
             await context.bot.send_message(chat_id=PROMO_CHANNEL_ID, text=promo_text, parse_mode="Markdown")
         except:
             pass
     
     await query.edit_message_text(f"✅ Account delivered!\n\nPhone: {phone}\nPrice: ₹{price}\n\nCheck your DM for session file.")
+
+async def import_zip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/importzip command handler"""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Unauthorized")
+        return
+    
+    await update.message.reply_text("📦 Please send a ZIP file containing .session files.")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle ZIP file upload"""
+    user_id = update.effective_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Unauthorized")
+        return
+    
+    if not update.message.document:
+        await update.message.reply_text("❌ No file found.")
+        return
+    
+    file_name = update.message.document.file_name
+    
+    if not file_name.endswith('.zip'):
+        await update.message.reply_text("❌ Only .zip files are allowed.")
+        return
+    
+    await update.message.reply_text(f"🔄 Processing `{file_name}`... Please wait.", parse_mode="Markdown")
+    
+    file = await update.message.document.get_file()
+    zip_path = f"/tmp/{file.file_id}.zip"
+    await file.download_to_drive(zip_path)
+    
+    temp_dir = tempfile.mkdtemp()
+    imported = []
+    failed = []
+    
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+        
+        for root, dirs, files in os.walk(temp_dir):
+            for fname in files:
+                if fname.endswith('.session'):
+                    session_path = os.path.join(root, fname)
+                    try:
+                        with open(session_path, 'rb') as f:
+                            session_base64 = base64.b64encode(f.read()).decode('utf-8')
+                        
+                        phone = fname.replace('.session', '')
+                        
+                        # Detect country
+                        if phone.startswith('+1'):
+                            country = '+1'
+                        elif phone.startswith('+91'):
+                            country = '+91'
+                        elif phone.startswith('+92'):
+                            country = '+92'
+                        else:
+                            country = '+91'
+                        
+                        add_account(phone, country, session_base64)
+                        add_session(phone, fname, session_base64)
+                        imported.append(phone)
+                        print(f"✅ Imported: {phone}")
+                        
+                    except Exception as e:
+                        failed.append(f"{fname}: {str(e)}")
+        
+        if imported:
+            await update.message.reply_text(
+                f"✅ **Import Complete!**\n\n"
+                f"✅ Imported: {len(imported)} accounts\n"
+                f"❌ Failed: {len(failed)}\n\n"
+                f"Use `/listacc` to see all accounts.",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ **No .session files found in ZIP!**\n\n"
+                f"Make sure your ZIP contains `.session` files.\n"
+                f"Files found: {', '.join(files) if files else 'none'}",
+                parse_mode="Markdown"
+            )
+    
+    except zipfile.BadZipFile:
+        await update.message.reply_text("❌ Invalid ZIP file. File might be corrupted.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+    
+    shutil.rmtree(temp_dir, ignore_errors=True)
+    os.remove(zip_path)
+
+async def list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Unauthorized")
+        return
+    
+    accounts = get_all_sessions()
+    
+    if not accounts:
+        await update.message.reply_text("📦 No accounts found. Use /importzip first.")
+        return
+    
+    text = f"📦 **Session Files ({len(accounts)}):**\n\n"
+    for phone, file_name in accounts[:20]:
+        text += f"• {phone} ({file_name})\n"
+    
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Unauthorized")
+        return
+    
+    available, sold = count_accounts()
+    c.execute("SELECT COUNT(*) FROM users")
+    users = c.fetchone()[0]
+    c.execute("SELECT SUM(balance) FROM users")
+    total_balance = c.fetchone()[0] or 0
+    
+    await update.message.reply_text(
+        f"📊 **Bot Stats**\n\n"
+        f"👥 Users: {users}\n"
+        f"📦 Available: {available}\n"
+        f"✅ Sold: {sold}\n"
+        f"💰 Total Balance: ₹{total_balance}",
+        parse_mode="Markdown"
+    )
 
 async def recharge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -222,122 +343,11 @@ async def approve_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         pass
 
-async def import_zip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Unauthorized")
-        return
-    
-    if not update.message.document:
-        await update.message.reply_text("Please send a ZIP file containing .session files.")
-        return
-    
-    await update.message.reply_text("🔄 Processing ZIP file... Please wait.")
-    
-    file = await update.message.document.get_file()
-    zip_path = f"/tmp/{file.file_id}.zip"
-    await file.download_to_drive(zip_path)
-    
-    temp_dir = tempfile.mkdtemp()
-    imported = []
-    failed = []
-    
-    try:
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(temp_dir)
-        
-        for root, dirs, files in os.walk(temp_dir):
-            for file_name in files:
-                if file_name.endswith('.session'):
-                    session_path = os.path.join(root, file_name)
-                    
-                    try:
-                        with open(session_path, 'rb') as f:
-                            session_base64 = base64.b64encode(f.read()).decode('utf-8')
-                        
-                        phone = file_name.replace('.session', '')
-                        
-                        # Detect country
-                        if phone.startswith('+1'):
-                            country = '+1'
-                        elif phone.startswith('+91'):
-                            country = '+91'
-                        elif phone.startswith('+92'):
-                            country = '+92'
-                        else:
-                            country = '+91'
-                        
-                        add_account(phone, country, session_base64)
-                        add_session(phone, file_name, session_base64)
-                        imported.append(phone)
-                        print(f"✅ Imported: {phone}")
-                        
-                    except Exception as e:
-                        failed.append(f"{file_name}: {str(e)}")
-    
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        os.remove(zip_path)
-        return
-    
-    shutil.rmtree(temp_dir, ignore_errors=True)
-    os.remove(zip_path)
-    
-    await update.message.reply_text(
-        f"✅ Import complete!\n\n"
-        f"Imported: {len(imported)} accounts\n"
-        f"Failed: {len(failed)}\n\n"
-        f"Use /listacc to see all accounts."
-    )
-
-async def list_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Unauthorized")
-        return
-    
-    accounts = get_all_sessions()
-    
-    if not accounts:
-        await update.message.reply_text("No accounts found. Use /importzip first.")
-        return
-    
-    text = f"📦 **Session Files ({len(accounts)}):**\n\n"
-    for phone, file_name in accounts[:20]:
-        text += f"• {phone} ({file_name})\n"
-    
-    await update.message.reply_text(text, parse_mode="Markdown")
-
-async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("❌ Unauthorized")
-        return
-    
-    available, sold = count_accounts()
-    c.execute("SELECT COUNT(*) FROM users")
-    users = c.fetchone()[0]
-    c.execute("SELECT SUM(balance) FROM users")
-    total_balance = c.fetchone()[0] or 0
-    
-    await update.message.reply_text(
-        f"📊 **Bot Stats**\n\n"
-        f"Users: {users}\n"
-        f"Available accounts: {available}\n"
-        f"Sold accounts: {sold}\n"
-        f"Total balance: ₹{total_balance}",
-        parse_mode="Markdown"
-    )
-
 async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     await update.message.reply_text("📜 Use /listacc (admin only) to see accounts")
-
-async def redeem_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎫 Send redeem code. Coming soon.")
 
 # ==================== MAIN ====================
 def main():
-    import base64  # Add this import
-    
     app = Application.builder().token(BOT_TOKEN).build()
     
     # User commands
@@ -346,17 +356,19 @@ def main():
     app.add_handler(CommandHandler("buy", buy_handler))
     app.add_handler(CommandHandler("recharge", recharge_handler))
     app.add_handler(CommandHandler("confirm", confirm_payment))
-    app.add_handler(CommandHandler("redeem", redeem_handler))
     app.add_handler(CommandHandler("history", history_handler))
     
     # Admin commands
     app.add_handler(CommandHandler("approve", approve_payment))
-    app.add_handler(CommandHandler("importzip", import_zip))
+    app.add_handler(CommandHandler("importzip", import_zip_command))
     app.add_handler(CommandHandler("listacc", list_accounts))
     app.add_handler(CommandHandler("stats", stats_handler))
     
     # Callbacks
     app.add_handler(CallbackQueryHandler(buy_callback, pattern="buy_"))
+    
+    # ⭐ IMPORTANT: File handler for ZIP uploads
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
     print("🤖 Bot started! Ready to import sessions.")
     app.run_polling()
