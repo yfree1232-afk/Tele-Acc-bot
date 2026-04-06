@@ -1,216 +1,188 @@
-from pymongo import MongoClient
-from pymongo.errors import DuplicateKeyError
+from motor.motor_asyncio import AsyncIOMotorClient
 from datetime import datetime
+import random
 from config import MONGO_URI, DATABASE_NAME
 
 class Database:
     def __init__(self):
-        self.client = MongoClient(MONGO_URI)
+        self.client = AsyncIOMotorClient(MONGO_URI)
         self.db = self.client[DATABASE_NAME]
         
         # Collections
         self.users = self.db.users
         self.accounts = self.db.accounts
         self.transactions = self.db.transactions
-        self.redeem_codes = self.db.redeem_codes
+        self.withdrawals = self.db.withdrawals
+        self.sessions = self.db.sessions
+        self.proxies = self.db.proxies
+        self.api_keys = self.db.api_keys
         self.settings = self.db.settings
-        
-        # Indexes
-        self.users.create_index("user_id", unique=True)
-        self.accounts.create_index("phone", unique=True)
-        self.accounts.create_index("status")
-        self.redeem_codes.create_index("code", unique=True)
     
     # ============ USER METHODS ============
-    def get_user(self, user_id):
-        return self.users.find_one({"user_id": user_id})
+    async def get_user(self, user_id):
+        return await self.users.find_one({"user_id": user_id})
     
-    def create_user(self, user_id, username=None, referred_by=None):
-        try:
-            self.users.insert_one({
-                "user_id": user_id,
-                "username": username,
-                "balance": 0,
-                "total_purchases": 0,
-                "total_spent": 0,
-                "joined_date": datetime.now(),
-                "referred_by": referred_by
-            })
-            return True
-        except DuplicateKeyError:
+    async def create_user(self, user_id, username=None, referred_by=None):
+        if await self.get_user(user_id):
             return False
+        
+        await self.users.insert_one({
+            "user_id": user_id,
+            "username": username,
+            "balance": 0,
+            "total_purchases": 0,
+            "total_spent": 0,
+            "is_blocked": False,
+            "is_trusted": False,
+            "fraud_score": 0,
+            "withdrawal_address": {},
+            "joined_date": datetime.now(),
+            "referred_by": referred_by
+        })
+        return True
     
-    def update_balance(self, user_id, amount):
-        self.users.update_one(
+    async def update_balance(self, user_id, amount):
+        await self.users.update_one(
             {"user_id": user_id},
             {"$inc": {"balance": amount}}
         )
+        return await self.get_user(user_id)
     
-    def get_balance(self, user_id):
-        user = self.users.find_one({"user_id": user_id})
+    async def get_balance(self, user_id):
+        user = await self.get_user(user_id)
         return user["balance"] if user else 0
     
-    # ============ PRICE METHODS ============
-    def get_price(self, country_code):
-        setting = self.settings.find_one({"key": f"price_{country_code}"})
-        if setting:
-            return setting["value"]
-        defaults = {"+1": 14, "+91": 12, "+92": 11}
-        return defaults.get(country_code, 10)
+    async def get_all_users(self, limit=100):
+        cursor = self.users.find().limit(limit)
+        return await cursor.to_list(length=limit)
     
-    def set_price(self, country_code, price):
-        self.settings.update_one(
-            {"key": f"price_{country_code}"},
-            {"$set": {"value": price, "updated_at": datetime.now()}},
-            upsert=True
-        )
-        return True
+    async def get_user_count(self):
+        return await self.users.count_documents({})
     
-    def get_all_prices(self):
-        prices = {}
-        for code in ["+1", "+91", "+92"]:
-            prices[code] = self.get_price(code)
-        return prices
+    async def get_total_balance(self):
+        pipeline = [{"$group": {"_id": None, "total": {"$sum": "$balance"}}}]
+        result = await self.users.aggregate(pipeline).to_list(length=1)
+        return result[0]["total"] if result else 0
     
     # ============ ACCOUNT METHODS ============
-    def add_account(self, phone, country_code, session_base64, first_name=None, username=None):
-        try:
-            self.accounts.insert_one({
-                "phone": phone,
+    async def add_account(self, phone, country_code, session_base64, cost_price=0):
+        await self.accounts.insert_one({
+            "phone": phone,
+            "country_code": country_code,
+            "session_base64": session_base64,
+            "cost_price": cost_price,
+            "status": "available",
+            "health_score": 100,
+            "sold_to": None,
+            "sold_at": None,
+            "added_at": datetime.now()
+        })
+        return True
+    
+    async def get_available_account(self, country_code):
+        account = await self.accounts.find_one_and_update(
+            {
                 "country_code": country_code,
-                "session_base64": session_base64,
-                "first_name": first_name,
-                "username": username,
                 "status": "available",
-                "sold_to": None,
-                "sold_at": None,
-                "added_at": datetime.now()
-            })
-            return True
-        except DuplicateKeyError:
-            return False
-    
-    def get_account_by_phone(self, phone):
-        return self.accounts.find_one({"phone": phone})
-    
-    def get_available_account(self, country_code):
-        account = self.accounts.find_one_and_update(
-            {
-                "country_code": country_code,
-                "status": "available"
+                "health_score": {"$gt": 70}
             },
-            {
-                "$set": {"status": "reserved"}
-            },
+            {"$set": {"status": "reserved"}},
             return_document=True
         )
         return account
     
-    def confirm_sale(self, account_id, user_id):
+    async def confirm_sale(self, account_id, user_id, price):
         from bson.objectid import ObjectId
-        self.accounts.update_one(
+        result = await self.accounts.update_one(
             {"_id": ObjectId(account_id)},
-            {
-                "$set": {
-                    "status": "sold",
-                    "sold_to": user_id,
-                    "sold_at": datetime.now()
-                }
-            }
+            {"$set": {
+                "status": "sold",
+                "sold_to": user_id,
+                "sold_at": datetime.now(),
+                "sold_price": price
+            }}
         )
+        return result.modified_count > 0
     
-    def release_account(self, account_id):
-        from bson.objectid import ObjectId
-        self.accounts.update_one(
-            {"_id": ObjectId(account_id)},
-            {"$set": {"status": "available"}}
-        )
-    
-    def get_account_stats(self):
-        total = self.accounts.count_documents({})
-        available = self.accounts.count_documents({"status": "available"})
-        sold = self.accounts.count_documents({"status": "sold"})
+    async def get_account_stats(self):
+        total = await self.accounts.count_documents({})
+        available = await self.accounts.count_documents({"status": "available"})
+        sold = await self.accounts.count_documents({"status": "sold"})
         return {"total": total, "available": available, "sold": sold}
     
-    def get_all_available_accounts(self):
-        return list(self.accounts.find({"status": "available"}))
+    async def update_account_health(self, account_id, health_score):
+        from bson.objectid import ObjectId
+        await self.accounts.update_one(
+            {"_id": ObjectId(account_id)},
+            {"$set": {"health_score": health_score}}
+        )
     
-    # ============ PURCHASE METHODS ============
-    def add_purchase(self, user_id, phone, country_code, amount):
-        self.transactions.insert_one({
+    # ============ TRANSACTIONS ============
+    async def add_transaction(self, user_id, type, amount, status, details=""):
+        await self.transactions.insert_one({
             "user_id": user_id,
-            "type": "purchase",
+            "type": type,
             "amount": amount,
-            "phone": phone,
-            "country_code": country_code,
-            "status": "completed",
+            "status": status,
+            "details": details,
             "created_at": datetime.now()
         })
-        
-        self.users.update_one(
+    
+    async def get_user_transactions(self, user_id, limit=20):
+        cursor = self.transactions.find({"user_id": user_id}).sort("created_at", -1).limit(limit)
+        return await cursor.to_list(length=limit)
+    
+    # ============ WITHDRAWALS ============
+    async def create_withdrawal(self, user_id, amount, method, address):
+        withdrawal = {
+            "user_id": user_id,
+            "amount": amount,
+            "method": method,
+            "address": address,
+            "status": "pending",
+            "created_at": datetime.now()
+        }
+        result = await self.withdrawals.insert_one(withdrawal)
+        return result.inserted_id
+    
+    async def get_pending_withdrawals(self):
+        cursor = self.withdrawals.find({"status": "pending"})
+        return await cursor.to_list(length=100)
+    
+    async def approve_withdrawal(self, withdrawal_id):
+        from bson.objectid import ObjectId
+        await self.withdrawals.update_one(
+            {"_id": ObjectId(withdrawal_id)},
+            {"$set": {"status": "completed", "approved_at": datetime.now()}}
+        )
+    
+    # ============ FRAUD DETECTION ============
+    async def update_fraud_score(self, user_id, score):
+        await self.users.update_one(
             {"user_id": user_id},
-            {"$inc": {"total_purchases": 1, "total_spent": amount}}
+            {"$inc": {"fraud_score": score}}
         )
-    
-    def get_user_purchases(self, user_id, limit=10):
-        return list(self.transactions.find(
-            {"user_id": user_id, "type": "purchase"}
-        ).sort("created_at", -1).limit(limit))
-    
-    # ============ REDEEM CODES ============
-    def add_redeem_code(self, code, amount):
-        try:
-            self.redeem_codes.insert_one({
-                "code": code,
-                "amount": amount,
-                "used_by": None,
-                "used_at": None,
-                "created_at": datetime.now()
-            })
+        
+        user = await self.get_user(user_id)
+        if user and user.get("fraud_score", 0) >= 81:
+            await self.users.update_one(
+                {"user_id": user_id},
+                {"$set": {"is_blocked": True}}
+            )
             return True
-        except DuplicateKeyError:
-            return False
-    
-    def redeem_code(self, code, user_id):
-        code_data = self.redeem_codes.find_one({"code": code})
-        
-        if not code_data:
-            return "invalid"
-        if code_data.get("used_by"):
-            return "used"
-        
-        amount = code_data["amount"]
-        
-        self.redeem_codes.update_one(
-            {"code": code},
-            {"$set": {"used_by": user_id, "used_at": datetime.now()}}
-        )
-        
-        self.update_balance(user_id, amount)
-        
-        self.transactions.insert_one({
-            "user_id": user_id,
-            "type": "redeem",
-            "amount": amount,
-            "code": code,
-            "status": "completed",
-            "created_at": datetime.now()
-        })
-        
-        return amount
+        return False
     
     # ============ STATS ============
-    def get_stats(self):
-        total_users = self.users.count_documents({})
-        total_balance = sum([u.get("balance", 0) for u in self.users.find()])
-        total_purchases = self.transactions.count_documents({"type": "purchase"})
-        total_revenue = sum([t.get("amount", 0) for t in self.transactions.find({"type": "purchase"})])
-        inventory = self.get_account_stats()
+    async def get_admin_stats(self):
+        user_count = await self.get_user_count()
+        total_balance = await self.get_total_balance()
+        account_stats = await self.get_account_stats()
+        pending_withdrawals = await self.withdrawals.count_documents({"status": "pending"})
         
         return {
-            "total_users": total_users,
+            "users": user_count,
             "total_balance": total_balance,
-            "total_purchases": total_purchases,
-            "total_revenue": total_revenue,
-            "inventory": inventory
+            "available_accounts": account_stats["available"],
+            "sold_accounts": account_stats["sold"],
+            "pending_withdrawals": pending_withdrawals
         }
