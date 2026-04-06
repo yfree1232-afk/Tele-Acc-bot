@@ -1,11 +1,9 @@
-import asyncio
 import logging
 import tempfile
 import base64
 import os
-from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
 from config import *
@@ -24,7 +22,6 @@ fraud_detection = FraudDetection(db)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # Check fraud
     fraud_score = await fraud_detection.analyze_user(user_id)
     if fraud_score >= 81:
         await update.message.reply_text("❌ Account blocked due to suspicious activity.")
@@ -37,14 +34,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await db.update_balance(int(ref), 5)
     
     balance = await db.get_balance(user_id)
-    await update.message.reply_text(START_MESSAGE.format(balance), parse_mode="Markdown")
+    await update.message.reply_text(START_MESSAGE.format(balance), parse_mode=ParseMode.MARKDOWN)
     await user_dashboard(update, context, db, user_id)
 
 async def balance_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     balance = await db.get_balance(query.from_user.id)
-    await query.edit_message_text(f"💰 Your balance: *₹{balance}*", parse_mode="Markdown")
+    await query.edit_message_text(f"💰 Your balance: *₹{balance}*", parse_mode=ParseMode.MARKDOWN)
 
 async def buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -54,7 +51,6 @@ async def buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         user_id = update.effective_user.id
     
-    # Check fraud
     fraud_score = await fraud_detection.analyze_user(user_id)
     if fraud_score >= 81:
         msg = "❌ Account blocked due to suspicious activity."
@@ -91,21 +87,15 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"❌ Insufficient balance!\nNeed: ₹{price}\nYour balance: ₹{balance}\n\nUse /recharge to add funds")
         return
     
-    # Get account with proxy matching country
-    proxy = proxy_manager.get_proxy_for_country(country_code)
     account = await db.get_available_account(country_code)
     
     if not account:
         await query.edit_message_text(f"❌ No {country_code} accounts available. Please check later.")
         return
     
-    # Deduct balance
     await db.update_balance(user_id, -price)
-    
-    # Add transaction
     await db.add_transaction(user_id, "purchase", price, "completed", f"Bought {country_code} account")
     
-    # Send session file
     session_base64 = account.get("session_base64")
     phone = account.get("phone")
     
@@ -129,62 +119,40 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             os.unlink(temp_file.name)
             delivery_text += "📁 *Session file sent above!*"
         except Exception as e:
-            delivery_text += f"⚠️ Error sending file: {str(e)[:50]}"
+            delivery_text += f"⚠️ Error sending file"
     
     await db.confirm_sale(account["_id"], user_id, price)
-    
-    await query.edit_message_text(delivery_text, parse_mode="Markdown")
+    await query.edit_message_text(delivery_text, parse_mode=ParseMode.MARKDOWN)
     await user_dashboard(update, context, db, user_id)
 
-# ============ ADMIN COMMANDS ============
+async def withdraw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("💸 Withdrawal feature coming soon!")
+
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("❌ Unauthorized")
         return
-    
     await admin_panel(update, context, db)
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
-    
     stats = await db.get_admin_stats()
     await update.message.reply_text(
-        f"📊 *Bot Statistics*\n\n"
-        f"👥 Users: {stats['users']}\n"
-        f"💰 Total Balance: ₹{stats['total_balance']}\n"
-        f"📦 Available: {stats['available_accounts']}\n"
-        f"✅ Sold: {stats['sold_accounts']}\n"
-        f"💸 Pending Withdrawals: {stats['pending_withdrawals']}",
-        parse_mode="Markdown"
+        f"📊 *Bot Statistics*\n\n👥 Users: {stats['users']}\n💰 Total Balance: ₹{stats['total_balance']}\n📦 Available: {stats['available_accounts']}\n✅ Sold: {stats['sold_accounts']}",
+        parse_mode=ParseMode.MARKDOWN
     )
 
-# ============ WITHDRAWAL ============
-async def withdraw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    balance = await db.get_balance(user_id)
-    
-    if balance < 50:
-        await query.edit_message_text("❌ Minimum withdrawal amount is ₹50")
-        return
-    
-    keyboard = []
-    for method, details in WITHDRAWAL_METHODS.items():
-        keyboard.append([InlineKeyboardButton(f"{method} (Min: ₹{details['min']})", callback_data=f"withdraw_{method}")])
-    
-    await query.edit_message_text("Select withdrawal method:", reply_markup=InlineKeyboardMarkup(keyboard))
-
 # ============ MAIN ============
-async def main():
+def main():
     app = Application.builder().token(BOT_TOKEN).build()
     
     # User commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stats", admin_stats))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("stats", admin_stats))
     
     # Callbacks
     app.add_handler(CallbackQueryHandler(balance_handler, pattern="balance"))
@@ -193,7 +161,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(withdraw_handler, pattern="withdraw"))
     
     print("🤖 Advanced Bot Started!")
-    await app.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
