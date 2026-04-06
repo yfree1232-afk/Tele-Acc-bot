@@ -13,8 +13,6 @@ async def admin_panel(update, context, db):
          InlineKeyboardButton("🌍 Countries", callback_data="admin_countries")],
         [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings"),
          InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("🔑 API/Proxy", callback_data="admin_api"),
-         InlineKeyboardButton("📈 Stats", callback_data="admin_stats")]
     ]
     
     text = ADMIN_PANEL_TEXT.format(
@@ -30,10 +28,9 @@ async def admin_panel(update, context, db):
     else:
         await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
-# User dashboard
 async def user_dashboard(update, context, db, user_id):
     user = await db.get_user(user_id)
-    balance = user["balance"] if user else 0
+    balance = user.get("balance", 0) if user else 0  # FIXED: .get() use karo
     
     stats = await db.get_account_stats()
     
@@ -51,7 +48,7 @@ async def user_dashboard(update, context, db, user_id):
 
 💰 Balance: `₹{balance}`
 📦 Available: {stats['available']} accounts
-✅ Purchased: {user.get('total_purchases', 0)}
+✅ Purchased: {user.get('total_purchases', 0) if user else 0}
 
 Use /buy to purchase accounts
 """
